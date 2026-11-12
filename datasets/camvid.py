@@ -21,10 +21,12 @@ class CamVid(BaseDataset):
                  scale_factor=16,
                  mean=[0.485, 0.456, 0.406], 
                  std=[0.229, 0.224, 0.225],
-                 bd_dilate_size=4):
+                 bd_dilate_size=4,
+                 bd_target='legacy', bd_mask_void=False, bd_void_radius=0):
 
         super(CamVid, self).__init__(ignore_label, base_size,
-                crop_size, scale_factor, mean, std)
+                crop_size, scale_factor, mean, std, bd_target, bd_mask_void,
+                bd_void_radius)
 
         self.root = root
         self.list_path = list_path
@@ -64,11 +66,12 @@ class CamVid(BaseDataset):
         return files
         
     def color2label(self, color_map):
-        label = np.ones(color_map.shape[:2])*self.ignore_label
+        dtype = np.int32 if self.ignore_label < 0 else np.uint8
+        label = np.full(color_map.shape[:2], self.ignore_label, dtype=dtype)
         for i, v in enumerate(self.color_list):
             label[(color_map == v).sum(2)==3] = i
 
-        return label.astype(np.uint8)
+        return label
     
     def label2color(self, label):
         color_map = np.zeros(label.shape+(3,))

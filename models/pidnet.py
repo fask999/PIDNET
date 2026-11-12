@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 from .model_utils import BasicBlock, Bottleneck, segmenthead, DAPPM, PAPPM, PagFM, Bag, Light_Bag
+from .context import DenseASPP, PMPM, validate_dense_rates
 import logging
 
 BatchNorm2d = nn.BatchNorm2d
@@ -16,9 +17,23 @@ algc = False
 
 class PIDNet(nn.Module):
 
-    def __init__(self, m=2, n=3, num_classes=19, planes=64, ppm_planes=96, head_planes=128, augment=True):
+    def __init__(self, m=2, n=3, num_classes=19, planes=64, ppm_planes=96, head_planes=128, augment=True, *,
+                 context='auto', dense_rates=(1, 2, 3, 4), atrous_mode='none',
+                 atrous_stage=5, atrous_block=1, atrous_rate=2):
         super(PIDNet, self).__init__()
         self.augment = augment
+        dense_rates = validate_dense_rates(dense_rates)
+        if context not in ('auto', 'pappm', 'dappm', 'pmpm', 'denseaspp'):
+            raise ValueError('context must be auto, pappm, dappm, pmpm, or denseaspp')
+        if atrous_mode not in ('none', 'fixed', 'fadc'):
+            raise ValueError('atrous_mode must be none, fixed, or fadc')
+        if type(atrous_stage) is not int or atrous_stage not in (3, 4, 5):
+            raise ValueError('atrous_stage must be 3, 4, or 5')
+        stage_blocks = n if atrous_stage in (3, 4) else 2
+        if type(atrous_block) is not int or not 1 <= atrous_block < stage_blocks:
+            raise ValueError('atrous_block must select a non-first block in the I stage')
+        if type(atrous_rate) is not int or atrous_rate < 1:
+            raise ValueError('atrous_rate must be a positive integer')
         
         # I Branch
         self.conv1 =  nn.Sequential(
@@ -66,7 +81,7 @@ class PIDNet(nn.Module):
                                      nn.Conv2d(planes * 8, planes * 2, kernel_size=3, padding=1, bias=False),
                                      BatchNorm2d(planes * 2, momentum=bn_mom),
                                      )
-            self.spp = PAPPM(planes * 16, ppm_planes, planes * 4)
+            self.spp = self._make_context(context, dense_rates, PAPPM, planes * 16, ppm_planes, planes * 4)
             self.dfm = Light_Bag(planes * 4, planes * 4)
         else:
             self.layer3_d = self._make_single_layer(BasicBlock, planes * 2, planes * 2)
@@ -79,7 +94,7 @@ class PIDNet(nn.Module):
                                      nn.Conv2d(planes * 8, planes * 2, kernel_size=3, padding=1, bias=False),
                                      BatchNorm2d(planes * 2, momentum=bn_mom),
                                      )
-            self.spp = DAPPM(planes * 16, ppm_planes, planes * 4)
+            self.spp = self._make_context(context, dense_rates, DAPPM, planes * 16, ppm_planes, planes * 4)
             self.dfm = Bag(planes * 4, planes * 4)
             
         self.layer5_d = self._make_layer(Bottleneck, planes * 2, planes * 2, 1)
@@ -98,6 +113,37 @@ class PIDNet(nn.Module):
             elif isinstance(m, BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+
+        if atrous_mode != 'none':
+            from .i_atrous import configure_i_atrous
+            configure_i_atrous(getattr(self, 'layer{}'.format(atrous_stage)),
+                               mode=atrous_mode, block_index=atrous_block, rate=atrous_rate)
+            # Dilation is not a convolution weight. Encode its settings in a
+            # persistent key so even raw strict load_state_dict rejects a mismatch.
+            signature = '_i_atrous_signature_{}_s{}_b{}_r{}'.format(
+                atrous_mode, atrous_stage, atrous_block, atrous_rate)
+            self.register_buffer(signature, torch.zeros((), dtype=torch.uint8))
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Check before any PIDNet tensor is copied, including when PIDNet is
+        # itself loaded recursively as a child of a wrapper.
+        if isinstance(self.spp, DenseASPP):
+            self.spp._check_checkpoint_rates(state_dict, prefix + 'spp.')
+        super(PIDNet, self)._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
+    @staticmethod
+    def _make_context(context, rates, default, inplanes, branch_planes, outplanes):
+        if context == 'auto':
+            return default(inplanes, branch_planes, outplanes)
+        if context == 'pappm':
+            return PAPPM(inplanes, branch_planes, outplanes)
+        if context == 'dappm':
+            return DAPPM(inplanes, branch_planes, outplanes)
+        if context == 'pmpm':
+            return PMPM(inplanes, branch_planes, outplanes)
+        return DenseASPP(inplanes, branch_planes, outplanes, rates)
 
 
     def _make_layer(self, block, inplanes, planes, blocks, stride=1):
@@ -181,48 +227,37 @@ class PIDNet(nn.Module):
         else:
             return x_      
 
-def get_seg_model(cfg, imgnet_pretrained):
+def get_seg_model(cfg, imgnet_pretrained, *, load_pretrained=True):
+    from utils.ablation_config import get_model_kwargs, get_pretrain_source
+    from utils.checkpoint import load_l_pretrained, load_model_checkpoint
+    kwargs = get_model_kwargs(cfg)
     
     if 's' in cfg.MODEL.NAME:
-        model = PIDNet(m=2, n=3, num_classes=cfg.DATASET.NUM_CLASSES, planes=32, ppm_planes=96, head_planes=128, augment=True)
+        model = PIDNet(m=2, n=3, num_classes=cfg.DATASET.NUM_CLASSES, planes=32, ppm_planes=96, head_planes=128, augment=True, **kwargs)
     elif 'm' in cfg.MODEL.NAME:
-        model = PIDNet(m=2, n=3, num_classes=cfg.DATASET.NUM_CLASSES, planes=64, ppm_planes=96, head_planes=128, augment=True)
+        model = PIDNet(m=2, n=3, num_classes=cfg.DATASET.NUM_CLASSES, planes=64, ppm_planes=96, head_planes=128, augment=True, **kwargs)
     else:
-        model = PIDNet(m=3, n=4, num_classes=cfg.DATASET.NUM_CLASSES, planes=64, ppm_planes=112, head_planes=256, augment=True)
+        model = PIDNet(m=3, n=4, num_classes=cfg.DATASET.NUM_CLASSES, planes=64, ppm_planes=112, head_planes=256, augment=True, **kwargs)
     
-    if imgnet_pretrained:
-        pretrained_state = torch.load(cfg.MODEL.PRETRAINED, map_location='cpu')['state_dict'] 
-        model_dict = model.state_dict()
-        pretrained_state = {k: v for k, v in pretrained_state.items() if (k in model_dict and v.shape == model_dict[k].shape)}
-        model_dict.update(pretrained_state)
-        msg = 'Loaded {} parameters!'.format(len(pretrained_state))
-        logging.info('Attention!!!')
-        logging.info(msg)
-        logging.info('Over!!!')
-        model.load_state_dict(model_dict, strict = False)
-    else:
-        pretrained_dict = torch.load(cfg.MODEL.PRETRAINED, map_location='cpu')
-        if 'state_dict' in pretrained_dict:
-            pretrained_dict = pretrained_dict['state_dict']
-        model_dict = model.state_dict()
-        pretrained_dict = {k[6:]: v for k, v in pretrained_dict.items() if (k[6:] in model_dict and v.shape == model_dict[k[6:]].shape)}
-        msg = 'Loaded {} parameters!'.format(len(pretrained_dict))
-        logging.info('Attention!!!')
-        logging.info(msg)
-        logging.info('Over!!!')
-        model_dict.update(pretrained_dict)
-        model.load_state_dict(model_dict, strict = False)
+    if load_pretrained:
+        source = get_pretrain_source(cfg)
+        if source != 'legacy':
+            count = load_l_pretrained(model, cfg.MODEL.PRETRAINED, source)
+            logging.info('Loaded %d shared PIDNet-L pretrained tensors', count)
+        elif cfg.MODEL.PRETRAINED:
+            count = load_model_checkpoint(model, cfg.MODEL.PRETRAINED, strict=False)
+            logging.info('Loaded %d matching pretrained model tensors', count)
     
     return model
 
-def get_pred_model(name, num_classes):
+def get_pred_model(name, num_classes, **model_kwargs):
     
     if 's' in name:
-        model = PIDNet(m=2, n=3, num_classes=num_classes, planes=32, ppm_planes=96, head_planes=128, augment=False)
+        model = PIDNet(m=2, n=3, num_classes=num_classes, planes=32, ppm_planes=96, head_planes=128, augment=False, **model_kwargs)
     elif 'm' in name:
-        model = PIDNet(m=2, n=3, num_classes=num_classes, planes=64, ppm_planes=96, head_planes=128, augment=False)
+        model = PIDNet(m=2, n=3, num_classes=num_classes, planes=64, ppm_planes=96, head_planes=128, augment=False, **model_kwargs)
     else:
-        model = PIDNet(m=3, n=4, num_classes=num_classes, planes=64, ppm_planes=112, head_planes=256, augment=False)
+        model = PIDNet(m=3, n=4, num_classes=num_classes, planes=64, ppm_planes=112, head_planes=256, augment=False, **model_kwargs)
     
     return model
 

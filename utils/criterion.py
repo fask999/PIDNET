@@ -1,6 +1,7 @@
 # ------------------------------------------------------------------------------
 # Modified based on https://github.com/HRNet/HRNet-Semantic-Segmentation
 # ------------------------------------------------------------------------------
+import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -24,18 +25,21 @@ class CrossEntropy(nn.Module):
 
     def forward(self, score, target):
 
-        if config.MODEL.NUM_OUTPUTS == 1:
+        if not isinstance(score, (list, tuple)):
             score = [score]
 
         balance_weights = config.LOSS.BALANCE_WEIGHTS
         sb_weights = config.LOSS.SB_WEIGHTS
         if len(balance_weights) == len(score):
-            return sum([w * self._forward(x, target) for (w, x) in zip(balance_weights, score)])
+            weights = balance_weights
         elif len(score) == 1:
-            return sb_weights * self._forward(score[0], target)
-        
+            weights = [sb_weights]
         else:
             raise ValueError("lengths of prediction and target are not identical!")
+
+        if not (target != self.ignore_label).any():
+            return sum(w * x[..., :0].sum() for w, x in zip(weights, score))
+        return sum(w * self._forward(x, target) for w, x in zip(weights, score))
 
         
 
@@ -70,12 +74,16 @@ class OhemCrossEntropy(nn.Module):
         tmp_target[tmp_target == self.ignore_label] = 0
         pred = pred.gather(1, tmp_target.unsqueeze(1))
         pred, ind = pred.contiguous().view(-1,)[mask].contiguous().sort()
+        if pred.numel() == 0:
+            return pixel_losses[mask].sum()
         min_value = pred[min(self.min_kept, pred.numel() - 1)]
         threshold = max(min_value, self.thresh)
 
         pixel_losses = pixel_losses[mask][ind]
-        pixel_losses = pixel_losses[pred < threshold]
-        return pixel_losses.mean()
+        selected = pixel_losses[pred < threshold]
+        if selected.numel() < min(self.min_kept, pred.numel()):
+            selected = pixel_losses[:min(self.min_kept, pred.numel())]
+        return selected.mean()
 
     def forward(self, score, target):
         
@@ -99,11 +107,12 @@ class OhemCrossEntropy(nn.Module):
             raise ValueError("lengths of prediction and target are not identical!")
 
 
-def weighted_bce(bd_pre, target):
-    n, c, h, w = bd_pre.size()
-    log_p = bd_pre.permute(0,2,3,1).contiguous().view(1, -1)
-    target_t = target.view(1, -1)
+def weighted_bce(bd_pre, target, single_class_bce_weight=0.0):
+    log_p = bd_pre.permute(0, 2, 3, 1).reshape(1, -1)
+    return _weighted_bce(log_p, target.reshape(1, -1), single_class_bce_weight)
 
+
+def _weighted_bce(log_p, target_t, single_class_bce_weight=0.0):
     pos_index = (target_t == 1)
     neg_index = (target_t == 0)
 
@@ -114,21 +123,46 @@ def weighted_bce(bd_pre, target):
     weight[pos_index] = neg_num * 1.0 / sum_num
     weight[neg_index] = pos_num * 1.0 / sum_num
 
-    loss = F.binary_cross_entropy_with_logits(log_p, target_t, weight, reduction='mean')
-
-    return loss
+    if single_class_bce_weight:
+        # Only binary target positions receive weight, even without void masking.
+        single_weight = (pos_index | neg_index).to(log_p.dtype) * single_class_bce_weight
+        weight = torch.where((pos_num > 0) & (neg_num > 0), weight, single_weight)
+    return F.binary_cross_entropy_with_logits(log_p, target_t, weight, reduction='mean')
 
 
 class BondaryLoss(nn.Module):
-    def __init__(self, coeff_bce = 20.0):
+    def __init__(self, coeff_bce=20.0, dice_weight=0.0, mask_void=False,
+                 single_class_bce_weight=0.0):
         super(BondaryLoss, self).__init__()
+        if (isinstance(single_class_bce_weight, bool) or
+                not isinstance(single_class_bce_weight, (int, float)) or
+                not math.isfinite(single_class_bce_weight) or single_class_bce_weight < 0):
+            raise ValueError('single_class_bce_weight must be finite and nonnegative')
         self.coeff_bce = coeff_bce
-        
-    def forward(self, bd_pre, bd_gt):
+        self.dice_weight = dice_weight
+        self.mask_void = mask_void
+        self.single_class_bce_weight = float(single_class_bce_weight)
 
-        bce_loss = self.coeff_bce * weighted_bce(bd_pre, bd_gt)
-        loss = bce_loss
-        
+    def forward(self, bd_pre, bd_gt):
+        if self.mask_void:
+            target = bd_gt.reshape(-1)
+            valid = target >= 0
+            logits = bd_pre.permute(0, 2, 3, 1).reshape(-1)[valid]
+            target = target[valid]
+            if target.numel() == 0:
+                return logits.sum()
+            loss = self.coeff_bce * _weighted_bce(logits, target, self.single_class_bce_weight)
+        else:
+            logits = bd_pre
+            target = bd_gt
+            loss = self.coeff_bce * weighted_bce(bd_pre, bd_gt, self.single_class_bce_weight)
+
+        if self.dice_weight:
+            prob = logits.float().reshape(-1).sigmoid()
+            target = target.float().reshape(-1)
+            dice = 1.0 - (2.0 * (prob * target).sum() + 1.0) / (
+                prob.sum() + target.sum() + 1.0)
+            loss = loss + self.dice_weight * dice
         return loss
     
 if __name__ == '__main__':

@@ -24,10 +24,12 @@ class Cityscapes(BaseDataset):
                  scale_factor=16,
                  mean=[0.485, 0.456, 0.406], 
                  std=[0.229, 0.224, 0.225],
-                 bd_dilate_size=4):
+                 bd_dilate_size=4,
+                 bd_target='legacy', bd_mask_void=False, bd_void_radius=0):
 
         super(Cityscapes, self).__init__(ignore_label, base_size,
-                crop_size, scale_factor, mean, std,)
+                crop_size, scale_factor, mean, std, bd_target, bd_mask_void,
+                bd_void_radius)
 
         self.root = root
         self.list_path = list_path
@@ -82,6 +84,8 @@ class Cityscapes(BaseDataset):
         return files
         
     def convert_label(self, label, inverse=False):
+        if not inverse and self.ignore_label < 0:
+            label = self.label_transform(label)
         temp = label.copy()
         if inverse:
             for v, k in self.label_mapping.items():

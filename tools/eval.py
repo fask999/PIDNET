@@ -23,6 +23,8 @@ from configs import config
 from configs import update_config
 from utils.function import testval, test
 from utils.utils import create_logger
+from utils.ablation_config import register_ablation_config, get_model_kwargs, get_boundary_kwargs, get_boundary_loss_kwargs
+from utils.checkpoint import load_model_checkpoint
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train segmentation network')
@@ -37,7 +39,10 @@ def parse_args():
                         nargs=argparse.REMAINDER)
 
     args = parser.parse_args()
+    register_ablation_config(config)
     update_config(config, args)
+    get_model_kwargs(config)
+    get_boundary_loss_kwargs(config)
 
     return args
 
@@ -56,7 +61,7 @@ def main():
     cudnn.enabled = config.CUDNN.ENABLED
 
     # build model
-    model = model = models.pidnet.get_seg_model(config, imgnet_pretrained=True)
+    model = models.pidnet.get_seg_model(config, imgnet_pretrained=True, load_pretrained=False)
 
     if config.TEST.MODEL_FILE:
         model_state_file = config.TEST.MODEL_FILE
@@ -65,17 +70,8 @@ def main():
    
     logger.info('=> loading model from {}'.format(model_state_file))
         
-    pretrained_dict = torch.load(model_state_file)
-    if 'state_dict' in pretrained_dict:
-        pretrained_dict = pretrained_dict['state_dict']
-    model_dict = model.state_dict()
-    pretrained_dict = {k[6:]: v for k, v in pretrained_dict.items()
-                        if k[6:] in model_dict.keys()}
-    for k, _ in pretrained_dict.items():
-        logger.info(
-            '=> loading {} from pretrained model'.format(k))
-    model_dict.update(pretrained_dict)
-    model.load_state_dict(model_dict)
+    count = load_model_checkpoint(model, model_state_file, strict=True)
+    logger.info('=> loaded %d model tensors', count)
 
     model = model.cuda()
 
@@ -89,7 +85,8 @@ def main():
                         flip=False,
                         ignore_label=config.TRAIN.IGNORE_LABEL,
                         base_size=config.TEST.BASE_SIZE,
-                        crop_size=test_size)
+                        crop_size=test_size,
+                        **get_boundary_kwargs(config))
 
     testloader = torch.utils.data.DataLoader(
         test_dataset,

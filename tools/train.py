@@ -25,6 +25,10 @@ from configs import update_config
 from utils.criterion import CrossEntropy, OhemCrossEntropy, BondaryLoss
 from utils.function import train, validate
 from utils.utils import create_logger, FullModel
+from utils.ablation_config import (register_ablation_config, get_model_kwargs,
+                                   get_boundary_kwargs, get_boundary_loss_kwargs)
+from utils.checkpoint import load_model_checkpoint
+from utils.training_checkpoint import read_training_checkpoint, restore_sgd_state
 
 
 def parse_args():
@@ -41,7 +45,10 @@ def parse_args():
                         nargs=argparse.REMAINDER)
 
     args = parser.parse_args()
+    register_ablation_config(config)
     update_config(config, args)
+    get_model_kwargs(config)
+    get_boundary_loss_kwargs(config)
 
     return args
 
@@ -61,11 +68,8 @@ def main():
     logger.info(pprint.pformat(args))
     logger.info(config)
 
-    writer_dict = {
-        'writer': SummaryWriter(tb_log_dir),
-        'train_global_steps': 0,
-        'valid_global_steps': 0,
-    }
+    checkpoint_path = os.path.join(final_output_dir, 'checkpoint.pth.tar')
+    checkpoint = read_training_checkpoint(checkpoint_path) if config.TRAIN.RESUME else None
 
     # cudnn related setting
     cudnn.benchmark = config.CUDNN.BENCHMARK
@@ -77,7 +81,11 @@ def main():
         return 0
     
     imgnet = 'imagenet' in config.MODEL.PRETRAINED
-    model = models.pidnet.get_seg_model(config, imgnet_pretrained=imgnet)
+    model = models.pidnet.get_seg_model(config, imgnet_pretrained=imgnet,
+                                        load_pretrained=checkpoint is None)
+    if checkpoint is not None:
+        load_model_checkpoint(model, checkpoint, strict=True)
+    boundary_kwargs = get_boundary_kwargs(config)
  
     batch_size = config.TRAIN.BATCH_SIZE_PER_GPU * len(gpus)
     # prepare data
@@ -91,7 +99,8 @@ def main():
                         ignore_label=config.TRAIN.IGNORE_LABEL,
                         base_size=config.TRAIN.BASE_SIZE,
                         crop_size=crop_size,
-                        scale_factor=config.TRAIN.SCALE_FACTOR)
+                        scale_factor=config.TRAIN.SCALE_FACTOR,
+                        **boundary_kwargs)
 
     trainloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -111,7 +120,8 @@ def main():
                         flip=False,
                         ignore_label=config.TRAIN.IGNORE_LABEL,
                         base_size=config.TEST.BASE_SIZE,
-                        crop_size=test_size)
+                        crop_size=test_size,
+                        **boundary_kwargs)
 
     testloader = torch.utils.data.DataLoader(
         test_dataset,
@@ -130,7 +140,7 @@ def main():
         sem_criterion = CrossEntropy(ignore_label=config.TRAIN.IGNORE_LABEL,
                                     weight=train_dataset.class_weights)
 
-    bd_criterion = BondaryLoss()
+    bd_criterion = BondaryLoss(**get_boundary_loss_kwargs(config))
     
     model = FullModel(model, sem_criterion, bd_criterion)
     model = nn.DataParallel(model, device_ids=gpus).cuda()
@@ -153,18 +163,19 @@ def main():
         
     best_mIoU = 0
     last_epoch = 0
-    flag_rm = config.TRAIN.RESUME
-    if config.TRAIN.RESUME:
-        model_state_file = os.path.join(final_output_dir, 'checkpoint.pth.tar')
-        if os.path.isfile(model_state_file):
-            checkpoint = torch.load(model_state_file, map_location={'cuda:0': 'cpu'})
-            best_mIoU = checkpoint['best_mIoU']
-            last_epoch = checkpoint['epoch']
-            dct = checkpoint['state_dict']
-            
-            model.module.model.load_state_dict({k.replace('model.', ''): v for k, v in dct.items() if k.startswith('model.')})
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            logger.info("=> loaded checkpoint (epoch {})".format(checkpoint['epoch']))
+    resume_first_epoch = checkpoint is not None
+    if checkpoint is not None:
+        restore_sgd_state(optimizer, checkpoint['optimizer'], checkpoint_path)
+        best_mIoU = float(checkpoint['best_mIoU'])
+        last_epoch = int(checkpoint['epoch'])
+        logger.info('=> loaded checkpoint (epoch %s)', last_epoch)
+        del checkpoint
+
+    writer_dict = {
+        'writer': SummaryWriter(tb_log_dir),
+        'train_global_steps': 0,
+        'valid_global_steps': 0,
+    }
 
     start = timeit.default_timer()
     end_epoch = config.TRAIN.END_EPOCH
@@ -181,28 +192,25 @@ def main():
                   epoch_iters, config.TRAIN.LR, num_iters,
                   trainloader, optimizer, model, writer_dict)
 
-        if flag_rm == 1 or (epoch % 5 == 0 and epoch < real_end - 100) or (epoch >= real_end - 100):
+        if resume_first_epoch or epoch % 5 == 0 or epoch >= real_end - 100:
             valid_loss, mean_IoU, IoU_array = validate(config, 
                         testloader, model, writer_dict)
-        if flag_rm == 1:
-            flag_rm = 0
+            resume_first_epoch = False
+            if mean_IoU > best_mIoU:
+                best_mIoU = float(mean_IoU)
+                torch.save(model.module.state_dict(), os.path.join(final_output_dir, 'best.pt'))
+            msg = 'Loss: {:.3f}, MeanIU: {: 4.4f}, Best_mIoU: {: 4.4f}'.format(
+                        valid_loss, mean_IoU, best_mIoU)
+            logging.info(msg)
+            logging.info(IoU_array)
 
-        logger.info('=> saving checkpoint to {}'.format(
-            final_output_dir + 'checkpoint.pth.tar'))
+        logger.info('=> saving checkpoint to %s', checkpoint_path)
         torch.save({
             'epoch': epoch+1,
             'best_mIoU': best_mIoU,
             'state_dict': model.module.state_dict(),
             'optimizer': optimizer.state_dict(),
-        }, os.path.join(final_output_dir,'checkpoint.pth.tar'))
-        if mean_IoU > best_mIoU:
-            best_mIoU = mean_IoU
-            torch.save(model.module.state_dict(),
-                    os.path.join(final_output_dir, 'best.pt'))
-        msg = 'Loss: {:.3f}, MeanIU: {: 4.4f}, Best_mIoU: {: 4.4f}'.format(
-                    valid_loss, mean_IoU, best_mIoU)
-        logging.info(msg)
-        logging.info(IoU_array)
+        }, checkpoint_path)
 
 
 

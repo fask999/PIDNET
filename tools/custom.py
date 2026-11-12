@@ -12,6 +12,10 @@ import models
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from configs import config, update_config
+from utils.ablation_config import (register_ablation_config, get_model_kwargs,
+                                   get_boundary_loss_kwargs, get_pretrain_source)
+from utils.checkpoint import load_model_checkpoint
 
 mean = [0.485, 0.456, 0.406]
 std = [0.229, 0.224, 0.225]
@@ -41,12 +45,30 @@ def parse_args():
     
     parser.add_argument('--a', help='pidnet-s, pidnet-m or pidnet-l', default='pidnet-l', type=str)
     parser.add_argument('--c', help='cityscapes pretrained or not', type=bool, default=True)
-    parser.add_argument('--p', help='dir for pretrained model', default='../pretrained_models/cityscapes/PIDNet_L_Cityscapes_test.pt', type=str)
+    parser.add_argument('--p', help='checkpoint path (L experiments can use TEST.MODEL_FILE)', type=str)
     parser.add_argument('--r', help='root or dir for input images', default='../samples/', type=str)
     parser.add_argument('--t', help='the format of input images (.jpg, .png, ...)', default='.png', type=str)     
+    parser.add_argument('--cfg', help='experiment config file', default=None, type=str)
+    parser.add_argument('--output-dir', help='directory for predicted images', default=None, type=str)
+    parser.add_argument('opts', help='config overrides', nargs=argparse.REMAINDER)
 
     args = parser.parse_args()
 
+    if args.cfg:
+        register_ablation_config(config)
+        update_config(config, args)
+        get_model_kwargs(config)
+        get_boundary_loss_kwargs(config)
+        if get_pretrain_source(config) != 'legacy':
+            if args.p is None:
+                args.p = config.TEST.MODEL_FILE
+            if not args.p.strip():
+                parser.error('PIDNet-L experiment prediction requires --p or TEST.MODEL_FILE')
+    elif args.opts:
+        parser.error('config overrides require --cfg')
+
+    if args.p is None:
+        args.p = '../pretrained_models/cityscapes/PIDNet_L_Cityscapes_test.pt'
     return args
 
 def input_transform(image):
@@ -57,33 +79,26 @@ def input_transform(image):
     return image
 
 def load_pretrained(model, pretrained):
-    pretrained_dict = torch.load(pretrained, map_location='cpu')
-    if 'state_dict' in pretrained_dict:
-        pretrained_dict = pretrained_dict['state_dict']
-    model_dict = model.state_dict()
-    pretrained_dict = {k[6:]: v for k, v in pretrained_dict.items() if (k[6:] in model_dict and v.shape == model_dict[k[6:]].shape)}
-    msg = 'Loaded {} parameters!'.format(len(pretrained_dict))
-    print('Attention!!!')
-    print(msg)
-    print('Over!!!')
-    model_dict.update(pretrained_dict)
-    model.load_state_dict(model_dict, strict = False)
-    
+    count = load_model_checkpoint(model, pretrained, strict=True, prediction=True)
+    print('Loaded {} model tensors'.format(count))
     return model
 
 if __name__ == '__main__':
     args = parse_args()
-    images_list = glob.glob(args.r+'*'+args.t)
-    sv_path = args.r+'outputs/'
+    images_list = glob.glob(os.path.join(args.r, '*' + args.t))
+    sv_path = args.output_dir or os.path.join(args.r, 'outputs')
     
-    model = models.pidnet.get_pred_model(args.a, 19 if args.c else 11)
+    if args.cfg:
+        model = models.pidnet.get_pred_model(config.MODEL.NAME, config.DATASET.NUM_CLASSES,
+                                              **get_model_kwargs(config))
+    else:
+        model = models.pidnet.get_pred_model(args.a, 19 if args.c else 11)
     model = load_pretrained(model, args.p).cuda()
     model.eval()
     with torch.no_grad():
         for img_path in images_list:
-            img_name = img_path.split("\\")[-1]
-            img = cv2.imread(os.path.join(args.r, img_name),
-                               cv2.IMREAD_COLOR)
+            img_name = os.path.basename(img_path)
+            img = cv2.imread(img_path, cv2.IMREAD_COLOR)
             sv_img = np.zeros_like(img).astype(np.uint8)
             img = input_transform(img)
             img = img.transpose((2, 0, 1)).copy()
@@ -99,10 +114,5 @@ if __name__ == '__main__':
             sv_img = Image.fromarray(sv_img)
             
             if not os.path.exists(sv_path):
-                os.mkdir(sv_path)
-            sv_img.save(sv_path+img_name)
-            
-            
-            
-        
-        
+                os.makedirs(sv_path)
+            sv_img.save(os.path.join(sv_path, img_name))

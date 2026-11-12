@@ -2,6 +2,16 @@
 	
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
+## PIDNet-L accuracy ablations in this fork
+
+- [RTX 4090 training launcher](docs/pidnet-l-4090.md)
+- [PIDNet-L ablation presets and initialization](docs/pidnet-l-ablation.md)
+- [Planned P/D branch improvements](docs/improvement-backlog.md)
+
+Accuracy gains have not yet been measured. Datasets, weights, run logs and private agent records referenced in development reports are local artifacts and are not included in this repository.
+
+## Original PIDNet project
+
 This is the official repository for our recent work: PIDNet ([PDF](https://arxiv.org/pdf/2206.02066)）
 
 **Caution: It appears the download links below are no longer working due to my missing Google Drive account. Please download all the weights via [this link](https://drive.google.com/drive/folders/0BySIOtxxULinfjlGdGFiT3NQVUdLVDBxWnhhTjB4VXNBRkFOa281WHlkektYY2VBcWVZb1k?resourcekey=0-w0JIXUekD-FCW-Rm1Z-HfQ&usp=sharing). Sorry for the inconvenience.**

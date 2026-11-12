@@ -1,0 +1,40 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+.env
+.env.*
+
+# Local agent state
+/.super-agent/
+/.superagent/
+/agent.md
+
+# Datasets and pretrained weights (tracked lists/readme files stay tracked)
+/data/cityscapes/
+/data/camvid/
+/pretrained_models/
+*.pt
+*.pth
+*.pth.tar
+*.ckpt
+*.onnx
+
+# Training products and private development evidence
+/output/
+/log/
+/logs/
+/runs/
+*.log
+events.out.tfevents.*
+/test/*/output/
+/test/*/logs/*
+/test/*/drafts/
+/test/*/tests/bn-fixture/
+/docs/**/polish-proposal.json
+
+# This historical path contains a reproducible source check, not a log.
+!/test/20261112-pidnet-l-ablation/logs/check-cli-cuda.py

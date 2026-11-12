@@ -1,0 +1,67 @@
+# Single-GPU copy of configs/camvid/pidnet_small_camvid.yaml.
+# Keep validation separate from training when comparing ablations.
+CUDNN:
+  BENCHMARK: true
+  DETERMINISTIC: false
+  ENABLED: true
+GPUS: (0,)
+OUTPUT_DIR: 'test/20261111-pidnet-ablation-switches/output'
+LOG_DIR: 'test/20261111-pidnet-ablation-switches/logs'
+WORKERS: 3
+PRINT_FREQ: 10
+
+DATASET:
+  DATASET: camvid
+  ROOT: data/
+  TEST_SET: 'list/camvid/val.lst'
+  TRAIN_SET: 'list/camvid/train.lst'
+  NUM_CLASSES: 11
+MODEL:
+  NAME: pidnet_s
+  NUM_OUTPUTS: 2
+  PRETRAINED: "pretrained_models/cityscapes/PIDNet_S_Cityscapes_test.pt"
+LOSS:
+  USE_OHEM: true
+  OHEMTHRES: 0.9
+  OHEMKEEP: 131072
+  BALANCE_WEIGHTS: [0.4, 1.0]
+  SB_WEIGHTS: 1.0
+TRAIN:
+  IMAGE_SIZE: [960, 720]
+  BASE_SIZE: 960
+  BATCH_SIZE_PER_GPU: 2
+  SHUFFLE: true
+  BEGIN_EPOCH: 0
+  END_EPOCH: 200
+  RESUME: false
+  OPTIMIZER: sgd
+  LR: 0.005
+  WD: 0.0005
+  MOMENTUM: 0.9
+  NESTEROV: false
+  FLIP: true
+  MULTI_SCALE: true
+  IGNORE_LABEL: 255
+  SCALE_FACTOR: 16
+TEST:
+  IMAGE_SIZE: [960, 720]
+  BASE_SIZE: 960
+  BATCH_SIZE_PER_GPU: 1
+  FLIP_TEST: false
+  MULTI_SCALE: false
+  MODEL_FILE: ''
+  OUTPUT_INDEX: 1
+ABLATION:
+  CONTEXT: auto
+  DENSE_RATES: [1, 2, 3, 4]
+  I_ATROUS:
+    MODE: none
+    STAGE: 5
+    BLOCK: 1
+    RATE: 2
+  BOUNDARY:
+    TARGET: legacy
+    WIDTH: 0
+    MASK_VOID: false
+    VOID_RADIUS: 0
+    DICE_WEIGHT: 0.0
